@@ -1,30 +1,32 @@
 import datetime
 import io
-import sqlite3
 import re
+import sqlite3
+import numpy as np
 import pandas as pd
 from PIL import Image
 import streamlit as st
 import easyocr
-import numpy as np
 
 # ==========================================
 # 1. 初始化 EasyOCR 讀取器 (快取避免重複載入)
 # ==========================================
 @st.cache_resource
 def get_ocr_reader():
-    # 支援繁體中文 (chinese_cht) 與英文 (en)
-    return easyocr.Reader(['chinese_cht', 'en'], gpu=False)
+    # ✅ 修正：EasyOCR 的繁體中文語言代碼為 'ch_tra'
+    return easyocr.Reader(['ch_tra', 'en'], gpu=False)
+
 
 # ==========================================
 # 2. 資料庫初始化與 Helper 函數
 # ==========================================
 DB_FILE = "tsmc_chip_data.db"
 
+
 def init_db():
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         CREATE TABLE IF NOT EXISTS chip_data (
             trade_date TEXT PRIMARY KEY,
             total_volume INTEGER,
@@ -38,20 +40,26 @@ def init_db():
             trust_sell INTEGER,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
+    """)
     conn.commit()
     conn.close()
 
+
 def load_data_by_date(date_str):
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM chip_data WHERE trade_date = ?", conn, params=(date_str,))
+    df = pd.read_sql_query(
+        "SELECT * FROM chip_data WHERE trade_date = ?",
+        conn,
+        params=(date_str,),
+    )
     conn.close()
     return df
+
 
 def save_or_update_data(data_dict):
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''
+    c.execute("""
         INSERT INTO chip_data (
             trade_date, total_volume, margin_buy, margin_sell,
             short_buy, short_sell, foreign_buy, foreign_sell,
@@ -68,56 +76,87 @@ def save_or_update_data(data_dict):
             trust_buy=excluded.trust_buy,
             trust_sell=excluded.trust_sell,
             updated_at=CURRENT_TIMESTAMP
-    ''', (
-        data_dict['trade_date'], data_dict['total_volume'],
-        data_dict['margin_buy'], data_dict['margin_sell'],
-        data_dict['short_buy'], data_dict['short_sell'],
-        data_dict['foreign_buy'], data_dict['foreign_sell'],
-        data_dict['trust_buy'], data_dict['trust_sell']
+    """, (
+        data_dict['trade_date'],
+        data_dict['total_volume'],
+        data_dict['margin_buy'],
+        data_dict['margin_sell'],
+        data_dict['short_buy'],
+        data_dict['short_sell'],
+        data_dict['foreign_buy'],
+        data_dict['foreign_sell'],
+        data_dict['trust_buy'],
+        data_dict['trust_sell']
     ))
     conn.commit()
     conn.close()
 
+
 def fetch_all_data():
     conn = sqlite3.connect(DB_FILE)
-    df = pd.read_sql_query("SELECT * FROM chip_data ORDER BY trade_date DESC", conn)
+    df = pd.read_sql_query(
+        "SELECT * FROM chip_data ORDER BY trade_date DESC", conn
+    )
     conn.close()
     return df
 
-def extract_chip_numbers_local(image: Image.Image) -> dict:
+
+def extract_chip_numbers_local(image: Image.Image):
     """使用本地 EasyOCR 辨識圖片中的文字與數字"""
     reader = get_ocr_reader()
     img_np = np.array(image)
-    
+
     # 執行 OCR 辨識
     results = reader.readtext(img_np)
-    
-    # 整理辨識出來的文字行
-    lines = [res[1] for res in results]
-    full_text = " ".join(lines)
-    
+
+    # 依畫面 Top (Y座標) -> Left (X座標) 進行文字排序
+    results = sorted(results, key=lambda x: (x[0][0][1], x[0][0][0]))
+
     parsed = {}
-    
-    # 利用簡單正規表示式對應關鍵字附近的數字
-    for line in lines:
-        # 清理數字字串 (移除逗號與空白)
-        numbers = re.findall(r'\d+', line.replace(',', ''))
-        
-        if '外資' in line or '外買' in line:
-            if numbers: parsed['foreign_buy'] = int(numbers[0])
-            if len(numbers) > 1: parsed['foreign_sell'] = int(numbers[1])
-        elif '投信' in line or '投買' in line:
-            if numbers: parsed['trust_buy'] = int(numbers[0])
-            if len(numbers) > 1: parsed['trust_sell'] = int(numbers[1])
-            
+    lines_text = [res[1].strip() for res in results]
+    full_text = " | ".join(lines_text)
+
+    # 表格抓取邏輯
+    for i, res in enumerate(results):
+        text = res[1].strip()
+
+        # 抓取「外資」Row
+        if "外資" in text or "外" in text:
+            nums = []
+            for j in range(i + 1, min(i + 6, len(results))):
+                cleaned = re.sub(r"[^\d]", "", results[j][1])
+                if cleaned:
+                    nums.append(int(cleaned))
+            if len(nums) >= 1:
+                parsed["foreign_buy"] = nums[0]   # 買進 (例如 42319)
+            if len(nums) >= 2:
+                parsed["foreign_sell"] = nums[1]  # 賣出 (例如 28539)
+
+        # 抓取「投信」Row
+        elif "投信" in text or "投" in text:
+            nums = []
+            for j in range(i + 1, min(i + 6, len(results))):
+                cleaned = re.sub(r"[^\d]", "", results[j][1])
+                if cleaned:
+                    nums.append(int(cleaned))
+            if len(nums) >= 1:
+                parsed["trust_buy"] = nums[0]    # 買進 (例如 7244)
+            if len(nums) >= 2:
+                parsed["trust_sell"] = nums[1]   # 賣出 (例如 180)
+
     return parsed, full_text
+
 
 init_db()
 
 # ==========================================
 # 3. Streamlit 介面配置
 # ==========================================
-st.set_page_config(page_title="台積電(2330) 籌碼資料庫 (本地OCR免金鑰)", page_icon="📸", layout="wide")
+st.set_page_config(
+    page_title="台積電(2330) 籌碼資料庫 (本地OCR免金鑰)",
+    page_icon="📸",
+    layout="wide"
+)
 
 st.title("📈 台積電 (2330) 籌碼資料庫 (100% 本地辨識/免API金鑰)")
 st.caption("使用本地端 EasyOCR 引擎進行圖片文字辨識，資料不外傳，完全免費。")
@@ -153,7 +192,11 @@ st.markdown("---")
 # ==========================================
 col_date, col_status = st.columns([1, 2])
 with col_date:
-    selected_date = st.date_input("📅 請選擇交易日期", value=datetime.date.today(), max_value=datetime.date.today())
+    selected_date = st.date_input(
+        "📅 請選擇交易日期",
+        value=datetime.date.today(),
+        max_value=datetime.date.today(),
+    )
     date_str = selected_date.strftime("%Y-%m-%d")
 
 existing_data = load_data_by_date(date_str)
@@ -180,7 +223,7 @@ target_image = camera_img or upload_img
 if target_image:
     image = Image.open(target_image)
     st.image(image, caption="待辨識的看盤畫面", use_container_width=True)
-    
+
     if st.button("🔍 啟動本地 OCR 辨識 (免金鑰)"):
         with st.spinner("本地 EasyOCR 辨識中，請稍候..."):
             try:
@@ -213,7 +256,7 @@ st.markdown("---")
 
 with st.form("chip_form"):
     col_input1, col_input2 = st.columns(2)
-    
+
     with col_input1:
         st.subheader("1️⃣ 信用交易與總成交量 (張)")
         total_volume = st.number_input("當日總交易張數", min_value=0, value=defaults["total_volume"], step=1000)
